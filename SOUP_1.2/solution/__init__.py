@@ -50,6 +50,11 @@ CONFIG = {
 
 def apply():
     """Master entry point invoked by Soup training harness before model building."""
+    import torch
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+
     # 0. Fast MemEfficient Attention (Cutlass SRAM online softmax on Turing)
     if CONFIG.get("attention"):
         try:
