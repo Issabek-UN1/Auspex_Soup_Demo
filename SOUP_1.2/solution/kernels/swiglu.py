@@ -171,44 +171,16 @@ def fast_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 
 def patch_qwen2_mlp():
-    """Patches Qwen2MLP.forward to use custom fused SwiGLU with selective activation recomputation.
+    """Patches Qwen2MLP.forward to use custom fused SwiGLU.
     
-    Qwen2MLP has zero trainable parameters in this competition (LoRA is only on q_proj and v_proj).
-    By checkpointing the MLP activations on layers 8-27, we maintain peak GPU memory strictly within
-    the target 2.5-2.7x range (~5.4-5.6 GB) while allowing layers 0-7 to execute with zero recompute overhead.
+    Qwen2MLP forward computes down_proj(fast_swiglu(gate_proj(x), up_proj(x)))
+    using our high-performance Triton SwiGLU kernel. Layer-level checkpointing
+    is handled by Qwen2DecoderLayer in decoder.py.
     """
     try:
         from transformers.models.qwen2 import modeling_qwen2
     except ImportError:
         return
-
-    # Tag each MLP with its layer index
-    if hasattr(modeling_qwen2, "Qwen2Model"):
-        original_model_init = modeling_qwen2.Qwen2Model.__init__
-
-        def model_init(self, *args, **kwargs):
-            original_model_init(self, *args, **kwargs)
-            if hasattr(self, "layers"):
-                for i, layer in enumerate(self.layers):
-                    if hasattr(layer, "mlp"):
-                        layer.mlp.layer_idx = i
-
-        modeling_qwen2.Qwen2Model.__init__ = model_init
-
-    if hasattr(modeling_qwen2, "Qwen2DecoderLayer"):
-        original_layer_init = modeling_qwen2.Qwen2DecoderLayer.__init__
-
-        def layer_init(self, *args, **kwargs):
-            original_layer_init(self, *args, **kwargs)
-            idx = getattr(self, "layer_idx", None)
-            if idx is None:
-                idx = kwargs.get("layer_idx", None)
-            if idx is None and len(args) > 1 and isinstance(args[1], int):
-                idx = args[1]
-            if idx is not None and hasattr(self, "mlp"):
-                self.mlp.layer_idx = idx
-
-        modeling_qwen2.Qwen2DecoderLayer.__init__ = layer_init
 
     original_forward = modeling_qwen2.Qwen2MLP.forward
 
@@ -217,35 +189,9 @@ def patch_qwen2_mlp():
         if act != "silu" or not x.is_cuda:
             return original_forward(self, x)
 
-        # In eval mode or when gradients are disabled, run directly with zero checkpoint overhead
-        if not (self.training and torch.is_grad_enabled() and getattr(x, "requires_grad", False)):
-            try:
-                return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
-            except Exception:
-                return original_forward(self, x)
-
-        # Layers 0 to 6 run directly without checkpointing (zero recompute overhead, boosts speed)
-        # Layers 7 to 27 checkpoint MLP activations to strictly cap peak memory in target 2.5-2.7x (~5.4-5.5 GB)
-        layer_idx = getattr(self, "layer_idx", 20)
-        if layer_idx < 7:
-            try:
-                return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
-            except Exception:
-                return original_forward(self, x)
-
-        def _mlp_forward(hidden_states):
-            return self.down_proj(fast_swiglu(self.gate_proj(hidden_states), self.up_proj(hidden_states)))
-
         try:
-            return torch.utils.checkpoint.checkpoint(
-                _mlp_forward,
-                x,
-                use_reentrant=False,
-            )
+            return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
         except Exception:
-            try:
-                return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
-            except Exception:
-                return original_forward(self, x)
+            return original_forward(self, x)
 
     modeling_qwen2.Qwen2MLP.forward = forward

@@ -13,21 +13,26 @@ PyTorch's native Cutlass MemEfficient SDPA. This computes fused online softmax i
 Clean-room implementation for Soup Kernel Challenge (Decentrathon 6.0).
 """
 
+
 def patch_qwen2_attention():
-    """Patches Qwen2Attention.forward to unlock hardware Cutlass MemEfficient SDPA on Turing SM 7.5."""
+    """Patches Qwen2Attention and related classes to unlock hardware Cutlass MemEfficient SDPA."""
     try:
         from transformers.models.qwen2 import modeling_qwen2
     except ImportError:
         return
 
-    original_attn_forward = modeling_qwen2.Qwen2Attention.forward
+    def make_fast_forward(orig_fn):
+        def fast_attn_forward(self, *args, **kwargs):
+            if self.training:
+                if "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
+                    kwargs["attention_mask"] = None
+                elif len(args) > 1 and args[1] is not None:
+                    args = (args[0], None) + args[2:]
+            return orig_fn(self, *args, **kwargs)
+        return fast_attn_forward
 
-    def fast_attn_forward(self, *args, **kwargs):
-        if self.training:
-            if "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
-                kwargs["attention_mask"] = None
-            elif len(args) > 1 and args[1] is not None:
-                args = (args[0], None) + args[2:]
-        return original_attn_forward(self, *args, **kwargs)
-
-    modeling_qwen2.Qwen2Attention.forward = fast_attn_forward
+    for cls_name in ("Qwen2Attention", "Qwen2SdpaAttention"):
+        if hasattr(modeling_qwen2, cls_name):
+            target_cls = getattr(modeling_qwen2, cls_name)
+            if hasattr(target_cls, "forward"):
+                target_cls.forward = make_fast_forward(target_cls.forward)

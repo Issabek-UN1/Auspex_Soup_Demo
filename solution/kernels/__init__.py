@@ -27,6 +27,8 @@ from .swiglu import (
     fast_swiglu,
     patch_qwen2_mlp,
 )
+from .attention import patch_qwen2_attention
+from .decoder import patch_qwen2_decoder
 
 __all__ = [
     "_chunked_cross_entropy_fused_kernel",
@@ -48,4 +50,6 @@ __all__ = [
     "FastSwiGLUFunction",
     "fast_swiglu",
     "patch_qwen2_mlp",
+    "patch_qwen2_attention",
+    "patch_qwen2_decoder",
 ]
