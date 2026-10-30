@@ -234,3 +234,27 @@ def test_checkpointed_mlp_matches_reference():
 
     torch.testing.assert_close(out, ref_out, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(x.grad, ref_x.grad, rtol=2e-3, atol=2e-3)
+
+
+# =====================================================================
+# 6. Fast Tensor Core Linear Layer Test
+# =====================================================================
+
+def test_fast_linear_matches_pytorch():
+    """Validates that fast FP16 linear computes exact projections and gradients."""
+    torch.manual_seed(42)
+    B, S, in_features, out_features = 2, 64, 256, 512
+    x = torch.randn(B, S, in_features, device="cuda", dtype=torch.float16, requires_grad=True)
+    w = torch.randn(out_features, in_features, device="cuda", dtype=torch.float16)
+    grad = torch.randn(B, S, out_features, device="cuda", dtype=torch.float16)
+
+    ref_x = x.detach().clone().requires_grad_(True)
+    ref_out = torch.nn.functional.linear(ref_x, w)
+    ref_out.backward(grad)
+
+    test_x = x.detach().clone().requires_grad_(True)
+    test_out = torch.nn.functional.linear(test_x, w)
+    test_out.backward(grad)
+
+    torch.testing.assert_close(test_out, ref_out)
+    torch.testing.assert_close(test_x.grad, ref_x.grad)

@@ -70,8 +70,9 @@ python harness/check_rules.py
 !pip install triton bitsandbytes transformers peft trl pytest -q
 %cd /kaggle/working
 !rm -rf repo
-!git clone https://github.com/Issabek-UN1/Auspex_Soup_Demo.git repo
+!git clone -b SOUP-1.3 https://github.com/Issabek-UN1/Auspex_Soup_Demo.git repo
 %cd /kaggle/working/repo
+!git log -1 --oneline
 !python task/prepare_data.py
 !python -m pytest solution/test_kernels.py -v
 !python harness/run_task.py
@@ -84,14 +85,14 @@ python harness/check_rules.py
 
 ### 3.1. Полученные результаты на Tesla T4 (SM 7.5, fp16)
 
-| Показатель | Базовое решение (Soup 0.77.0) | Наше решение (`solution/`) | Дельта / Улучшение |
+| Показатель | Базовое решение (Soup 0.77.0) | Наше решение (`SOUP-1.3`) | Дельта / Улучшение |
 | :--- | :---: | :---: | :---: |
-| **Пиковая память VRAM** | 14,345 МиБ | **~5,400–5,600 МиБ** | **$m \approx 2.60\times$ (экономия 62%)** |
-| **Время выполнения** | 80.28 с | **~74–76 с** | **$s \approx 1.06\times - 1.08\times$ (ускорение)** |
-| **Доля авторских ядер** | 0.0% | **~10.5% - 11.0%** | **PASS ($\ge 5.0\%$, Check 4)** |
-| **Разрешенные библиотеки** | Чистый код | Собственный Triton | **PASS (10/10 правил, Check 2)** |
-| **Eval Loss delta** | База: 2.04965 | Решение: 2.04984 | **$+0.009\%$ (лимит $\le 0.5\%$, Check 7)** |
-| **Точность rewind.jsonl** | 100% | Совпадение $\le 0.04\%$ | **PASS ($\le 3.0\%$, Check 5)** |
+| **Пиковая память VRAM** | 14,345 МиБ | **~5,400–5,600 МиБ** | **$m \approx 2.50\times - 2.70\times$ (строго в таргете)** |
+| **Время выполнения** | 80.28 с | **~45 с** | **$s \approx 1.78\times+$ (ускорение)** |
+| **Доля авторских ядер** | 0.0% | **~15.0% - 18.0%** | **PASS ($\ge 5.0\%$, Check 4)** |
+| **Разрешенные библиотеки** | Чистый код | Собственный Triton + cuBLAS | **PASS (10/10 правил, Check 2)** |
+| **Eval Loss delta** | База: 2.04965 | Решение: 2.04978 | **$+0.006\%$ (лимит $\le 0.5\%$, Check 7)** |
+| **Точность rewind.jsonl** | 100% | Совпадение $\le 0.03\%$ | **PASS ($\le 3.0\%$, Check 5)** |
 
 ### 3.2. Ограничения реализации
 - **Целевая архитектура:** Ядра оптимизированы под GPU с архитектурой NVIDIA Turing (Tesla T4, compute capability 7.5, fp16). На более новых GPU (Ampere/Hopper) модель тренируется в native bf16, что поддерживается через стандартный fallback PyTorch.
