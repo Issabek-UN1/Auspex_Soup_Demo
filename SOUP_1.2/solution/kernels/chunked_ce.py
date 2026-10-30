@@ -1,0 +1,328 @@
+"""High-Performance Fused Token-Chunked Cross-Entropy Loss + Online Metrics for Qwen2.5.
+Computes Online Softmax, Cross-Entropy Loss, Shannon Entropy, Top-1 Accuracy,
+and in-place backward gradients in Triton.
+
+Design highlights:
+1. Online Softmax in FP32 registers: numerically stable, eliminates NaN/overflow risks on fp16.
+2. In-place gradient calculation in Pass 2: writes directly into logits buffer,
+   eliminating the need to allocate separate backward gradient tensors for logits.
+3. Full sequence entropy and accuracy tracking: satisfies exact Soup rewind.jsonl invariants (Check 5).
+4. Direct GEMM backward: piece_grad = flat_logits @ head_weight.
+
+Clean-room implementation for Soup Kernel Challenge (Decentrathon 6.0).
+"""
+
+from typing import Any, Optional, Tuple
+import torch
+import triton
+import triton.language as tl
+
+IGNORE_INDEX = -100
+
+
+@triton.jit
+def _chunked_cross_entropy_fused_kernel(
+    logits_ptr,          # [N_rows, V] fp16
+    targets_ptr,         # [N_rows] int64
+    losses_ptr,          # [N_rows] fp32 out
+    entropies_ptr,       # [N_rows] fp32 out
+    correct_ptr,         # [N_rows] int32 out
+    stride_logits_row,   # Stride between rows in logits
+    V,                   # Vocabulary size (e.g. 151936)
+    denominator,         # Normalizing denominator (float)
+    ignore_index: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    """Fused Cross-Entropy, Online Softmax, Entropy, Accuracy, and In-place Gradient."""
+    row_idx = tl.program_id(0)
+    target = tl.load(targets_ptr + row_idx)
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_row
+
+    # Online Softmax running statistics in FP32 registers
+    # -10000.0 is safe in FP16 (avoids underflow to -inf and subsequent NaN on multiplication)
+    m = -10000.0
+    d = 0.0
+    w = 0.0
+    max_val = -10000.0
+    max_idx = -1
+    z_target = 0.0
+
+    n_tiles = tl.cdiv(V, BLOCK_V)
+
+    # -----------------------------------------------------------------
+    # PASS 1: Online Softmax, Argmax, Cross-Entropy Loss & Entropy
+    # -----------------------------------------------------------------
+    for tile_k in range(0, n_tiles):
+        col_offsets = tile_k * BLOCK_V + tl.arange(0, BLOCK_V)
+        mask = col_offsets < V
+
+        # Load tile in fp16, cast to fp32 accumulator
+        z = tl.load(logits_row_ptr + col_offsets, mask=mask, other=-10000.0).to(tl.float32)
+
+        tile_max = tl.max(z, axis=0)
+        tile_argmax_local = tl.argmax(z, axis=0)
+        tile_argmax = tile_k * BLOCK_V + tile_argmax_local
+
+        new_m = tl.maximum(m, tile_max)
+        alpha = tl.exp(m - new_m)
+
+        # Zero out-of-bounds elements explicitly to prevent (-inf * 0.0 = NaN)
+        exp_z = tl.where(mask, tl.exp(z - new_m), 0.0)
+        z_safe = tl.where(mask, z, 0.0)
+
+        d = d * alpha + tl.sum(exp_z, axis=0)
+        w = w * alpha + tl.sum(z_safe * exp_z, axis=0)
+
+        # Update global argmax
+        is_new_max = tile_max > max_val
+        max_idx = tl.where(is_new_max, tile_argmax, max_idx)
+        max_val = tl.maximum(max_val, tile_max)
+        m = new_m
+
+        # Capture target logit if target is within current tile
+        is_target = col_offsets == target
+        z_target += tl.sum(tl.where(is_target & mask, z, 0.0), axis=0)
+
+    # Compute row-level metrics
+    is_ignored = (target == ignore_index)
+    safe_d = tl.maximum(d, 1e-12)
+    log_d = tl.log(safe_d)
+
+    raw_loss = log_d + m - z_target
+    # Shannon entropy: H(p) = -sum(p * log p) = log_d + m - (w / d)
+    raw_entropy = tl.maximum(0.0, log_d + m - (w / safe_d))
+    raw_correct = tl.where(max_idx == target, 1, 0)
+
+    loss = tl.where(is_ignored, 0.0, raw_loss)
+    correct = tl.where(is_ignored, 0, raw_correct)
+
+    tl.store(losses_ptr + row_idx, loss)
+    # Entropy recorded for all sequence positions matching base Soup contract
+    tl.store(entropies_ptr + row_idx, raw_entropy)
+    tl.store(correct_ptr + row_idx, correct)
+
+    # -----------------------------------------------------------------
+    # PASS 2: In-place Gradient Calculation directly inside logits_ptr
+    # -----------------------------------------------------------------
+    for tile_k in range(0, n_tiles):
+        col_offsets = tile_k * BLOCK_V + tl.arange(0, BLOCK_V)
+        mask = col_offsets < V
+
+        z = tl.load(logits_row_ptr + col_offsets, mask=mask, other=-10000.0).to(tl.float32)
+        prob = tl.where(mask, tl.exp(z - m) / safe_d, 0.0)
+        is_target = tl.where(col_offsets == target, 1.0, 0.0)
+
+        # Softmax cross-entropy gradient: (p - y) / denominator
+        grad = tl.where(is_ignored, 0.0, (prob - is_target) / denominator)
+
+        # Store in-place back to logits buffer
+        tl.store(logits_row_ptr + col_offsets, grad.to(logits_ptr.dtype.element_ty), mask=mask)
+
+
+def _extract_head_weight(head: Any) -> Optional[torch.Tensor]:
+    """Safely extracts weight tensor from head callable, module, or bound method."""
+    # 1. Direct weight attribute
+    w = getattr(head, "weight", None)
+    if isinstance(w, torch.Tensor):
+        return w
+
+    # 2. Bound method __self__
+    self_obj = getattr(head, "__self__", None)
+    if self_obj is not None:
+        w = getattr(self_obj, "weight", None)
+        if isinstance(w, torch.Tensor):
+            return w
+        if hasattr(self_obj, "get_output_embeddings"):
+            try:
+                emb = self_obj.get_output_embeddings()
+                w = getattr(emb, "weight", None)
+                if isinstance(w, torch.Tensor):
+                    return w
+            except Exception:
+                pass
+
+    # 3. Closure inspection
+    closure = getattr(head, "__closure__", None)
+    if closure:
+        for cell in closure:
+            val = getattr(cell, "cell_contents", None)
+            w = getattr(val, "weight", None)
+            if isinstance(w, torch.Tensor):
+                return w
+            if hasattr(val, "get_output_embeddings"):
+                try:
+                    emb = val.get_output_embeddings()
+                    w = getattr(emb, "weight", None)
+                    if isinstance(w, torch.Tensor):
+                        return w
+                except Exception:
+                    pass
+
+    return None
+
+
+def chunk_cross_entropy_triton(
+    head: Any,
+    piece: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int = IGNORE_INDEX,
+    denominator: float = 1.0,
+    with_grad: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Evaluates cross-entropy loss and metrics on a single sequence chunk.
+    
+    Returns:
+        total_loss, entropy, token_loss, hits, piece_grad
+    """
+    weight = _extract_head_weight(head)
+
+    if with_grad and weight is None:
+        piece_in = piece.detach().requires_grad_(True)
+        with torch.enable_grad():
+            logits = head(piece_in)
+    else:
+        piece_in = None
+        logits = head(piece)
+
+    orig_shape = logits.shape
+    V = orig_shape[-1]
+    flat_logits = logits.contiguous().view(-1, V)
+    N_rows = flat_logits.shape[0]
+    flat_targets = target.contiguous().view(-1)
+
+    losses = torch.empty(N_rows, device=piece.device, dtype=torch.float32)
+    entropies = torch.empty(N_rows, device=piece.device, dtype=torch.float32)
+    correct = torch.empty(N_rows, device=piece.device, dtype=torch.int32)
+
+    BLOCK_V = 4096
+    num_warps = 8
+
+    _chunked_cross_entropy_fused_kernel[(N_rows,)](
+        flat_logits,
+        flat_targets,
+        losses,
+        entropies,
+        correct,
+        stride_logits_row=flat_logits.stride(0),
+        V=V,
+        denominator=float(denominator),
+        ignore_index=ignore_index,
+        BLOCK_V=BLOCK_V,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+    losses = torch.nan_to_num(losses, nan=0.0, posinf=0.0, neginf=0.0)
+    entropies = torch.nan_to_num(entropies, nan=0.0, posinf=0.0, neginf=0.0)
+
+    total_loss = losses.sum()
+    entropy = entropies.view(orig_shape[:-1])
+    token_loss = losses.view(orig_shape[:-1])
+    hits = correct.sum()
+
+    if with_grad:
+        if weight is not None:
+            # Fast direct GEMM: piece_grad = grad_logits @ W
+            head_weight = weight.to(flat_logits.dtype)
+            flat_piece_grad = torch.matmul(flat_logits, head_weight)
+            piece_grad = flat_piece_grad.view(piece.shape)
+        elif piece_in is not None:
+            grads = torch.autograd.grad(
+                logits,
+                piece_in,
+                grad_outputs=flat_logits.view(logits.shape),
+                retain_graph=False,
+            )
+            piece_grad = grads[0]
+        else:
+            piece_grad = torch.zeros_like(piece)
+    else:
+        piece_grad = None
+
+    return total_loss, entropy, token_loss, hits, piece_grad
+
+
+def make_triton_chunked_loss_function():
+    """Builds a torch.autograd.Function integrating chunked head loss."""
+    class TritonChunkedHeadLoss(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, head, target, chunk, denominator, ignore_index, with_grad):
+            grad = torch.zeros_like(hidden) if with_grad else None
+            total = torch.zeros((), dtype=torch.float32, device=hidden.device)
+            entropies, losses = [], []
+            correct = torch.zeros((), dtype=torch.long, device=hidden.device)
+
+            for start in range(0, hidden.shape[1], chunk):
+                stop = start + chunk
+                piece = hidden[:, start:stop]
+                labels = target[:, start:stop]
+
+                part, entropy, token_loss, hits, piece_grad = chunk_cross_entropy_triton(
+                    head, piece, labels, ignore_index=ignore_index,
+                    denominator=denominator, with_grad=with_grad
+                )
+
+                if with_grad:
+                    grad[:, start:stop] = piece_grad.to(hidden.dtype)
+                total = total + part
+                entropies.append(entropy)
+                losses.append(token_loss)
+                correct = correct + hits
+
+            token_entropy = torch.cat(entropies, dim=1)
+            token_entropy = torch.nan_to_num(token_entropy, nan=0.0, posinf=0.0, neginf=0.0)
+            token_loss = torch.cat(losses, dim=1)
+            token_loss = torch.nan_to_num(token_loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+            ctx.with_grad = with_grad
+            if with_grad:
+                ctx.save_for_backward(grad)
+            ctx.mark_non_differentiable(token_entropy, token_loss, correct)
+            den = float(denominator) if float(denominator) > 0 else 1.0
+            return total / den, token_entropy, token_loss, correct
+
+        @staticmethod
+        def backward(ctx, grad_loss, _grad_entropy, _grad_token_loss, _grad_correct):
+            if not ctx.with_grad:
+                return (None,) * 7
+            (grad,) = ctx.saved_tensors
+            return ((grad * grad_loss).to(grad.dtype), None, None, None, None, None, None)
+
+    return TritonChunkedHeadLoss
+
+
+def patch_soup_chunked_loss(chunk_size: int = 32):
+    """Integrates Triton chunked head loss into Soup runtime."""
+    try:
+        from soup_cli.trainer.sft import SFTTrainerWrapper
+        from soup_cli.utils.stream_loss_chunk import (
+            ChunkedHeadLoss,
+            causal_lm_of,
+        )
+        import soup_cli.utils.stream_loss_chunk as slc
+    except ImportError:
+        return
+
+    # Patch inner autograd function
+    slc._chunked_function = make_triton_chunked_loss_function
+
+    # Patch SFTTrainerWrapper setup hook
+    original_setup = SFTTrainerWrapper._setup_transformers
+
+    def _setup_transformers_with_custom_chunk(self, cfg, tcfg):
+        result = original_setup(self, cfg, tcfg)
+        model = getattr(self, "model", None)
+        if model is None or not isinstance(model, torch.nn.Module):
+            return result
+        has_cuda = any(p.is_cuda for p in model.parameters()) if hasattr(model, "parameters") else False
+        if not has_cuda:
+            return result
+
+        if getattr(self, "_stream_loss_chunk_hook", None) is None:
+            try:
+                self._stream_loss_chunk_hook = ChunkedHeadLoss(causal_lm_of(model), chunk_size)
+            except Exception:
+                pass
+        return result
+
+    SFTTrainerWrapper._setup_transformers = _setup_transformers_with_custom_chunk
