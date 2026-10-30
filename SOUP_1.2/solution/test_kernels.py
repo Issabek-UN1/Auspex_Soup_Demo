@@ -181,3 +181,50 @@ def test_rope_matches_pytorch(dtype, shape):
     tol = TOLERANCE[dtype]
     torch.testing.assert_close(tri_out, ref_out, rtol=tol, atol=tol)
     torch.testing.assert_close(x.grad, ref_x.grad, rtol=tol, atol=tol)
+
+
+# =====================================================================
+# 5. Checkpointed MLP Activation Recomputation Test
+# =====================================================================
+
+def test_checkpointed_mlp_matches_reference():
+    """Validates that selective activation checkpointing in MLP produces exact gradients."""
+    from solution.kernels.swiglu import fast_swiglu
+
+    torch.manual_seed(42)
+    B, S, H, intermediate = 2, 64, 256, 512
+    x = torch.randn(B, S, H, device="cuda", dtype=torch.float16, requires_grad=True)
+    grad = torch.randn(B, S, H, device="cuda", dtype=torch.float16)
+
+    gate_w = torch.randn(intermediate, H, device="cuda", dtype=torch.float16)
+    up_w = torch.randn(intermediate, H, device="cuda", dtype=torch.float16)
+    down_w = torch.randn(H, intermediate, device="cuda", dtype=torch.float16)
+
+    class DummyMLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = torch.nn.Linear(H, intermediate, bias=False, dtype=torch.float16)
+            self.up_proj = torch.nn.Linear(H, intermediate, bias=False, dtype=torch.float16)
+            self.down_proj = torch.nn.Linear(intermediate, H, bias=False, dtype=torch.float16)
+            self.gate_proj.weight.data.copy_(gate_w)
+            self.up_proj.weight.data.copy_(up_w)
+            self.down_proj.weight.data.copy_(down_w)
+            self.training = True
+
+        def forward(self, hidden_states):
+            def _mlp_forward(h):
+                return self.down_proj(fast_swiglu(self.gate_proj(h), self.up_proj(h)))
+            return torch.utils.checkpoint.checkpoint(_mlp_forward, hidden_states, use_reentrant=False)
+
+    ref_x = x.detach().clone().requires_grad_(True)
+    ref_gate = torch.nn.functional.linear(ref_x, gate_w)
+    ref_up = torch.nn.functional.linear(ref_x, up_w)
+    ref_out = torch.nn.functional.linear(torch.nn.functional.silu(ref_gate) * ref_up, down_w)
+    ref_out.backward(grad)
+
+    mlp = DummyMLP()
+    out = mlp(x)
+    out.backward(grad)
+
+    torch.testing.assert_close(out, ref_out, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(x.grad, ref_x.grad, rtol=2e-3, atol=2e-3)
