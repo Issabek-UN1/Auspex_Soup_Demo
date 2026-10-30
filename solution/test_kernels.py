@@ -203,18 +203,19 @@ def test_checkpointed_mlp_matches_reference():
     class DummyMLP(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.gate_proj = torch.nn.Linear(H, intermediate, bias=False, dtype=torch.float16)
-            self.up_proj = torch.nn.Linear(H, intermediate, bias=False, dtype=torch.float16)
-            self.down_proj = torch.nn.Linear(intermediate, H, bias=False, dtype=torch.float16)
+            self.gate_proj = torch.nn.Linear(H, intermediate, bias=False, dtype=torch.float16, device="cuda")
+            self.up_proj = torch.nn.Linear(H, intermediate, bias=False, dtype=torch.float16, device="cuda")
+            self.down_proj = torch.nn.Linear(intermediate, H, bias=False, dtype=torch.float16, device="cuda")
             self.gate_proj.weight.data.copy_(gate_w)
             self.up_proj.weight.data.copy_(up_w)
             self.down_proj.weight.data.copy_(down_w)
             self.training = True
 
         def forward(self, hidden_states):
-            def _mlp_forward(h):
-                return self.down_proj(fast_swiglu(self.gate_proj(h), self.up_proj(h)))
-            return torch.utils.checkpoint.checkpoint(_mlp_forward, hidden_states, use_reentrant=False)
+            def _swiglu_forward(h):
+                return fast_swiglu(self.gate_proj(h), self.up_proj(h))
+            swiglu_out = torch.utils.checkpoint.checkpoint(_swiglu_forward, hidden_states, use_reentrant=False)
+            return self.down_proj(swiglu_out)
 
     ref_x = x.detach().clone().requires_grad_(True)
     ref_gate = torch.nn.functional.linear(ref_x, gate_w)
@@ -222,7 +223,7 @@ def test_checkpointed_mlp_matches_reference():
     ref_out = torch.nn.functional.linear(torch.nn.functional.silu(ref_gate) * ref_up, down_w)
     ref_out.backward(grad)
 
-    mlp = DummyMLP()
+    mlp = DummyMLP().to("cuda")
     out = mlp(x)
     out.backward(grad)
 

@@ -200,16 +200,18 @@ def patch_qwen2_mlp():
             except Exception:
                 return original_forward(self, x)
 
-        # Selective MLP activation recomputation: saves ~2.9 GB VRAM across 28 layers
-        def _mlp_forward(hidden_states):
-            return self.down_proj(fast_swiglu(self.gate_proj(hidden_states), self.up_proj(hidden_states)))
+        # Selective SwiGLU recomputation: checkpoint only gate, up, and swiglu.
+        # down_proj is kept outside checkpoint so its 13.7M-weight forward pass is NEVER recomputed in backward!
+        def _swiglu_forward(hidden_states):
+            return fast_swiglu(self.gate_proj(hidden_states), self.up_proj(hidden_states))
 
         try:
-            return torch.utils.checkpoint.checkpoint(
-                _mlp_forward,
+            swiglu_out = torch.utils.checkpoint.checkpoint(
+                _swiglu_forward,
                 x,
                 use_reentrant=False,
             )
+            return self.down_proj(swiglu_out)
         except Exception:
             try:
                 return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
