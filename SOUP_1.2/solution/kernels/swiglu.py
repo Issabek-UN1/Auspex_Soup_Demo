@@ -183,6 +183,18 @@ def patch_qwen2_mlp():
         return
 
     # Tag each MLP with its layer index
+    if hasattr(modeling_qwen2, "Qwen2Model"):
+        original_model_init = modeling_qwen2.Qwen2Model.__init__
+
+        def model_init(self, *args, **kwargs):
+            original_model_init(self, *args, **kwargs)
+            if hasattr(self, "layers"):
+                for i, layer in enumerate(self.layers):
+                    if hasattr(layer, "mlp"):
+                        layer.mlp.layer_idx = i
+
+        modeling_qwen2.Qwen2Model.__init__ = model_init
+
     if hasattr(modeling_qwen2, "Qwen2DecoderLayer"):
         original_layer_init = modeling_qwen2.Qwen2DecoderLayer.__init__
 
@@ -212,10 +224,10 @@ def patch_qwen2_mlp():
             except Exception:
                 return original_forward(self, x)
 
-        # Layers 0 to 5 run directly without checkpointing (zero recompute overhead)
-        # Layers 6 to 27 checkpoint MLP activations to strictly cap peak memory in target 2.5-2.7x (~5.4-5.5 GB)
+        # Layers 0 to 6 run directly without checkpointing (zero recompute overhead, boosts speed)
+        # Layers 7 to 27 checkpoint MLP activations to strictly cap peak memory in target 2.5-2.7x (~5.4-5.5 GB)
         layer_idx = getattr(self, "layer_idx", 20)
-        if layer_idx < 6:
+        if layer_idx < 7:
             try:
                 return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
             except Exception:

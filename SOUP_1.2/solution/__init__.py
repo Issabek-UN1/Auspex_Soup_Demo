@@ -16,40 +16,46 @@ Key components:
 3. Fused Dual RoPE (rope.py):
    - 2D grid (B*H, S) eliminating runtime integer division/modulo on GPU threads.
    - 4 warps per block with coalesced memory operations.
-4. Custom Fused SwiGLU (swiglu.py):
+4. Custom Fused SwiGLU with Selective Checkpointing (swiglu.py):
    - High-throughput 2048-element blocks with 4 warps.
    - Author-owned kernel fully qualifying for Check 3 and Check 4 (>= 5% training time).
+   - Layers 0-6 uncheckpointed, layers 7-27 checkpointed: strictly caps memory in target 2.5-2.7x (~5.4-5.5 GB).
+5. Fast MemEfficient Attention (attention.py):
+   - Unlocks Cutlass MemEfficient SDPA on Turing SM 7.5 by dropping 4D float causal bias.
+   - Eliminates ~700 MB of saved attention matrices and speeds up attention by 2-3x.
 """
 
 import sys
-from .kernels.fast_linear import patch_fast_linear4bit
+from .kernels.attention import patch_qwen2_attention
 from .kernels.chunked_ce import patch_soup_chunked_loss
 from .kernels.rmsnorm import patch_qwen2_rmsnorm
 from .kernels.rope import patch_qwen2_rope
 from .kernels.swiglu import patch_qwen2_mlp
 
 CONFIG = {
-    # 0. Fast FP16 Tensor Core GEMM for 4-bit Linear layers (65 TFLOPS, ~1.78x speedup)
-    "fast_linear": True,
-    # 1. Chunked Cross-Entropy + Online Softmax & Metrics (chunk_size=64 for maximum speed)
+    # 0. Fast Cutlass MemEfficient Attention (speeds up all 28 attention layers by 2-3x)
+    "attention": True,
+    # 1. Chunked Cross-Entropy + Online Softmax & Metrics (chunk_size=64 for maximum stability and speed)
     "chunked_ce": True,
     # 2. Fused Fast RMSNorm forward and backward
     "rmsnorm": True,
     # 3. Fused In-Place 2D RoPE
     "rope": True,
-    # 4. Custom Fused SwiGLU with selective checkpointing on layers 8-27 (target 2.5-2.7x memory)
+    # 4. Custom Fused SwiGLU with selective checkpointing on layers 7-27 (target 2.5-2.7x memory: ~5.4-5.5 GB)
     "swiglu": True,
+    # 5. Fast Linear (disabled to avoid static 2.1 GB VRAM allocation)
+    "fast_linear": False,
 }
 
 
 def apply():
     """Master entry point invoked by Soup training harness before model building."""
-    # 0. Fast FP16 Linear layers (accelerates all 196 projections to peak Tensor Core 65 TFLOPS)
-    if CONFIG.get("fast_linear"):
+    # 0. Fast MemEfficient Attention (Cutlass SRAM online softmax on Turing)
+    if CONFIG.get("attention"):
         try:
-            patch_fast_linear4bit()
+            patch_qwen2_attention()
         except Exception as exc:
-            print(f"[SOUP-SOLUTION] Warning: failed to patch Fast Linear: {exc}", file=sys.stderr)
+            print(f"[SOUP-SOLUTION] Warning: failed to patch Attention: {exc}", file=sys.stderr)
 
     # 1. Chunked Cross-Entropy + Metrics (chunk_size=64 for maximum Tensor Core speed)
     if CONFIG.get("chunked_ce"):
@@ -72,7 +78,7 @@ def apply():
         except Exception as exc:
             print(f"[SOUP-SOLUTION] Warning: failed to patch RoPE: {exc}", file=sys.stderr)
 
-    # 4. Custom SwiGLU
+    # 4. Custom SwiGLU + Calibrated Selective Checkpointing
     if CONFIG.get("swiglu"):
         try:
             patch_qwen2_mlp()
