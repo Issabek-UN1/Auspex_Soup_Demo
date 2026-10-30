@@ -107,7 +107,7 @@ class FastSwiGLUFunction(torch.autograd.Function):
         N_rows = gate_2d.shape[0]
 
         out = torch.empty_like(gate_2d)
-        BLOCK_SIZE = 1024
+        BLOCK_SIZE = 2048
         n_blocks = triton.cdiv(N_cols, BLOCK_SIZE)
         grid = (N_rows, n_blocks)
 
