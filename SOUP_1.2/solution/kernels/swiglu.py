@@ -186,10 +186,15 @@ def patch_qwen2_mlp():
     if hasattr(modeling_qwen2, "Qwen2DecoderLayer"):
         original_layer_init = modeling_qwen2.Qwen2DecoderLayer.__init__
 
-        def layer_init(self, config, layer_idx: int):
-            original_layer_init(self, config, layer_idx)
-            if hasattr(self, "mlp"):
-                self.mlp.layer_idx = layer_idx
+        def layer_init(self, *args, **kwargs):
+            original_layer_init(self, *args, **kwargs)
+            idx = getattr(self, "layer_idx", None)
+            if idx is None:
+                idx = kwargs.get("layer_idx", None)
+            if idx is None and len(args) > 1 and isinstance(args[1], int):
+                idx = args[1]
+            if idx is not None and hasattr(self, "mlp"):
+                self.mlp.layer_idx = idx
 
         modeling_qwen2.Qwen2DecoderLayer.__init__ = layer_init
 
@@ -207,27 +212,24 @@ def patch_qwen2_mlp():
             except Exception:
                 return original_forward(self, x)
 
-        # Layers 0 to 7 run directly without checkpointing (zero recompute overhead)
-        # Layers 8 to 27 checkpoint SwiGLU activations to cap peak memory at target 2.5-2.7x (~5.4 GB)
+        # Layers 0 to 5 run directly without checkpointing (zero recompute overhead)
+        # Layers 6 to 27 checkpoint MLP activations to strictly cap peak memory in target 2.5-2.7x (~5.4-5.5 GB)
         layer_idx = getattr(self, "layer_idx", 20)
-        if layer_idx < 8:
+        if layer_idx < 6:
             try:
                 return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
             except Exception:
                 return original_forward(self, x)
 
-        # Selective SwiGLU recomputation: checkpoint only gate, up, and swiglu.
-        # down_proj is kept outside checkpoint so its forward pass is NEVER recomputed in backward!
-        def _swiglu_forward(hidden_states):
-            return fast_swiglu(self.gate_proj(hidden_states), self.up_proj(hidden_states))
+        def _mlp_forward(hidden_states):
+            return self.down_proj(fast_swiglu(self.gate_proj(hidden_states), self.up_proj(hidden_states)))
 
         try:
-            swiglu_out = torch.utils.checkpoint.checkpoint(
-                _swiglu_forward,
+            return torch.utils.checkpoint.checkpoint(
+                _mlp_forward,
                 x,
                 use_reentrant=False,
             )
-            return self.down_proj(swiglu_out)
         except Exception:
             try:
                 return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))

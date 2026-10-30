@@ -198,7 +198,8 @@ def test_checkpointed_mlp_matches_reference():
     scale_in = 1.0 / (H ** 0.5)
     scale_mid = 1.0 / (intermediate ** 0.5)
 
-    x = torch.randn(B, S, H, device="cuda", dtype=torch.float16, requires_grad=True) * 0.1
+    raw_x = torch.randn(B, S, H, device="cuda", dtype=torch.float16) * 0.1
+    x = raw_x.detach().clone().requires_grad_(True)
     grad = torch.randn(B, S, H, device="cuda", dtype=torch.float16) * 0.1
 
     gate_w = torch.randn(intermediate, H, device="cuda", dtype=torch.float16) * scale_in
@@ -217,12 +218,11 @@ def test_checkpointed_mlp_matches_reference():
             self.training = True
 
         def forward(self, hidden_states):
-            def _swiglu_forward(h):
-                return fast_swiglu(self.gate_proj(h), self.up_proj(h))
-            swiglu_out = torch.utils.checkpoint.checkpoint(_swiglu_forward, hidden_states, use_reentrant=False)
-            return self.down_proj(swiglu_out)
+            def _mlp_forward(h):
+                return self.down_proj(fast_swiglu(self.gate_proj(h), self.up_proj(h)))
+            return torch.utils.checkpoint.checkpoint(_mlp_forward, hidden_states, use_reentrant=False)
 
-    ref_x = x.detach().clone().requires_grad_(True)
+    ref_x = raw_x.detach().clone().requires_grad_(True)
     ref_gate = torch.nn.functional.linear(ref_x, gate_w)
     ref_up = torch.nn.functional.linear(ref_x, up_w)
     ref_out = torch.nn.functional.linear(torch.nn.functional.silu(ref_gate) * ref_up, down_w)
