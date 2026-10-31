@@ -18,6 +18,7 @@ Key performance optimizations for Tesla T4 (Turing SM 7.5):
 Clean-room author implementation for Soup Kernel Challenge (Decentrathon 6.0).
 """
 
+import os
 import sys
 from typing import Any, Optional, Tuple
 import torch
@@ -278,6 +279,8 @@ def make_triton_chunked_loss_function():
     class TritonChunkedHeadLoss(torch.autograd.Function):
         @staticmethod
         def forward(ctx, hidden, head, target, chunk, denominator, ignore_index, with_grad):
+            # Avoid a device-to-host synchronization for the same denominator on every chunk.
+            denominator = max(float(denominator), 1.0)
             grad = torch.zeros_like(hidden) if with_grad else None
             total = torch.zeros((), dtype=torch.float32, device=hidden.device)
             entropies, losses = [], []
@@ -334,6 +337,10 @@ def patch_soup_chunked_loss(chunk_size: int = 128):
     except ImportError:
         return
 
+    chunk_size = int(os.environ.get("SOUP_LOSS_CHUNK", chunk_size))
+    if chunk_size < 1:
+        raise ValueError("SOUP_LOSS_CHUNK must be a positive integer")
+
     # Patch inner autograd function
     slc._chunked_function = make_triton_chunked_loss_function
 
@@ -349,6 +356,9 @@ def patch_soup_chunked_loss(chunk_size: int = 128):
         if not has_cuda:
             return result
 
+        from ..frozen_head import compact_frozen_head
+
+        compact_frozen_head(model)
         if getattr(self, "_stream_loss_chunk_hook", None) is None:
             try:
                 self._stream_loss_chunk_hook = ChunkedHeadLoss(causal_lm_of(model), chunk_size)
