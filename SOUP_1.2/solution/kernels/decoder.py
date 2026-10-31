@@ -93,8 +93,11 @@ def patch_qwen2_decoder(num_uncheckpointed: int = 6):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ):
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
         # Fallback to original for non-CUDA or when not training
-        if not hidden_states.is_cuda or not self.training or not torch.is_grad_enabled():
+        if not getattr(hidden_states, "is_cuda", False) or not self.training or not torch.is_grad_enabled():
             return orig_decoder_forward(
                 self,
                 hidden_states,
@@ -115,7 +118,11 @@ def patch_qwen2_decoder(num_uncheckpointed: int = 6):
 
         # 1. Input RMSNorm
         residual = hidden_states
+        if isinstance(residual, tuple):
+            residual = residual[0]
         normed = self.input_layernorm(hidden_states)
+        if isinstance(normed, tuple):
+            normed = normed[0]
 
         # 2. Self Attention (attention_mask=None unlocks hardware Cutlass MemEfficient SDPA in SRAM)
         attn_kwargs = {k: v for k, v in kwargs.items() if k != "attention_mask"}
@@ -130,11 +137,17 @@ def patch_qwen2_decoder(num_uncheckpointed: int = 6):
             **attn_kwargs,
         )
         attn_out = attn_res[0] if isinstance(attn_res, tuple) else attn_res
+        if isinstance(attn_out, tuple):
+            attn_out = attn_out[0]
         hidden_states = residual + attn_out
 
         # 3. Post Attention RMSNorm
         residual = hidden_states
+        if isinstance(residual, tuple):
+            residual = residual[0]
         normed_post = self.post_attention_layernorm(hidden_states)
+        if isinstance(normed_post, tuple):
+            normed_post = normed_post[0]
 
         # 4. Selective MLP Checkpointing:
         # Layers 0 to num_uncheckpointed - 1: execute directly with ZERO recompute overhead
@@ -150,6 +163,9 @@ def patch_qwen2_decoder(num_uncheckpointed: int = 6):
                 normed_post,
                 use_reentrant=False,
             )
+
+        if isinstance(mlp_out, tuple):
+            mlp_out = mlp_out[0]
 
         hidden_states = residual + mlp_out
 

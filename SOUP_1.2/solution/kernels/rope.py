@@ -400,7 +400,12 @@ class FastRoPEFunction(torch.autograd.Function):
 
 def apply_fast_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Applies rotary position embedding to input tensor."""
-    return FastRoPEFunction.apply(x, cos, sin)
+    if isinstance(x, tuple):
+        x = x[0]
+    out = FastRoPEFunction.apply(x, cos, sin)
+    if isinstance(out, tuple):
+        out = out[0]
+    return out
 
 
 def patch_qwen2_rope():
@@ -413,7 +418,11 @@ def patch_qwen2_rope():
     original_apply_rotary = modeling_qwen2.apply_rotary_pos_emb
 
     def apply_rotary_pos_emb_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-        if not q.is_cuda or q.shape[-1] != 128:
+        if isinstance(q, tuple):
+            q = q[0]
+        if isinstance(k, tuple):
+            k = k[0]
+        if not getattr(q, "is_cuda", False) or q.shape[-1] != 128:
             return original_apply_rotary(q, k, cos, sin, position_ids, unsqueeze_dim)
 
         if cos.ndim == 2:
@@ -425,6 +434,10 @@ def patch_qwen2_rope():
 
         q_rot = apply_fast_rope(q, cos, sin)
         k_rot = apply_fast_rope(k, cos, sin)
+        if isinstance(q_rot, tuple):
+            q_rot = q_rot[0]
+        if isinstance(k_rot, tuple):
+            k_rot = k_rot[0]
         return q_rot, k_rot
 
     modeling_qwen2.apply_rotary_pos_emb = apply_rotary_pos_emb_patched

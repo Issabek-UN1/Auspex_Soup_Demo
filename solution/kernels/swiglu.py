@@ -102,6 +102,11 @@ class FastSwiGLUFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, gate: torch.Tensor, up: torch.Tensor):
+        if isinstance(gate, tuple):
+            gate = gate[0]
+        if isinstance(up, tuple):
+            up = up[0]
+
         orig_shape = gate.shape
         N_cols = orig_shape[-1]
         gate_2d = gate.contiguous().view(-1, N_cols)
@@ -130,10 +135,14 @@ class FastSwiGLUFunction(torch.autograd.Function):
         ctx.orig_shape = orig_shape
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.N_cols = N_cols
-        return out.view(orig_shape)
+        res = out.view(orig_shape)
+        return res
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        if isinstance(grad_output, tuple):
+            grad_output = grad_output[0]
+
         gate_2d, up_2d = ctx.saved_tensors
         orig_shape = ctx.orig_shape
         N_cols = ctx.N_cols
@@ -169,7 +178,14 @@ class FastSwiGLUFunction(torch.autograd.Function):
 
 def fast_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """Applies custom fused SwiGLU."""
-    return FastSwiGLUFunction.apply(gate, up)
+    if isinstance(gate, tuple):
+        gate = gate[0]
+    if isinstance(up, tuple):
+        up = up[0]
+    res = FastSwiGLUFunction.apply(gate, up)
+    if isinstance(res, tuple):
+        res = res[0]
+    return res
 
 
 def patch_qwen2_mlp():
@@ -187,10 +203,27 @@ def patch_qwen2_mlp():
     original_forward = modeling_qwen2.Qwen2MLP.forward
 
     def forward(self, x):
+        if isinstance(x, tuple):
+            x = x[0]
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
-        if act != "silu" or not x.is_cuda:
+        if act != "silu" or not getattr(x, "is_cuda", False):
             return original_forward(self, x)
 
-        return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
+        gate = self.gate_proj(x)
+        if isinstance(gate, tuple):
+            gate = gate[0]
+
+        up = self.up_proj(x)
+        if isinstance(up, tuple):
+            up = up[0]
+
+        h = fast_swiglu(gate, up)
+        if isinstance(h, tuple):
+            h = h[0]
+
+        output = self.down_proj(h)
+        if isinstance(output, tuple):
+            output = output[0]
+        return output
 
     modeling_qwen2.Qwen2MLP.forward = forward

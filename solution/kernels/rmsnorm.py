@@ -173,7 +173,14 @@ class FastRMSNormFunction(torch.autograd.Function):
 
 def fast_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Entry point for Fused RMSNorm."""
-    return FastRMSNormFunction.apply(x, weight, eps)
+    if isinstance(x, tuple):
+        x = x[0]
+    if isinstance(weight, tuple):
+        weight = weight[0]
+    out = FastRMSNormFunction.apply(x, weight, eps)
+    if isinstance(out, tuple):
+        out = out[0]
+    return out
 
 
 def patch_qwen2_rmsnorm():
@@ -186,8 +193,13 @@ def patch_qwen2_rmsnorm():
     original_forward = modeling_qwen2.Qwen2RMSNorm.forward
 
     def forward(self, hidden_states):
-        if not hidden_states.is_cuda or self.weight is None or not self.weight.is_cuda:
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        if not getattr(hidden_states, "is_cuda", False) or self.weight is None or not getattr(self.weight, "is_cuda", False):
             return original_forward(self, hidden_states)
-        return fast_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        out = fast_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out
 
     modeling_qwen2.Qwen2RMSNorm.forward = forward
