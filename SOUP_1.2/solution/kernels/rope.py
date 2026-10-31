@@ -209,15 +209,12 @@ def patch_qwen2_rope():
         if not q.is_cuda or q.shape[-1] != 128:
             return original_apply_rotary(q, k, cos, sin, position_ids, unsqueeze_dim)
 
-        try:
-            if cos.ndim == 3 and unsqueeze_dim == 1:
-                cos = cos.unsqueeze(1)
-                sin = sin.unsqueeze(1)
+        if cos.ndim == 3 and unsqueeze_dim == 1:
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
 
-            q_rot = apply_fast_rope(q, cos, sin)
-            k_rot = apply_fast_rope(k, cos, sin)
-            return q_rot, k_rot
-        except Exception:
-            return original_apply_rotary(q, k, cos, sin, position_ids, unsqueeze_dim)
+        q_rot = apply_fast_rope(q, cos, sin)
+        k_rot = apply_fast_rope(k, cos, sin)
+        return q_rot, k_rot
 
     modeling_qwen2.apply_rotary_pos_emb = apply_rotary_pos_emb_patched

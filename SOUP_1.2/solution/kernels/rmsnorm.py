@@ -186,9 +186,6 @@ def patch_qwen2_rmsnorm():
     def forward(self, hidden_states):
         if not hidden_states.is_cuda or self.weight is None or not self.weight.is_cuda:
             return original_forward(self, hidden_states)
-        try:
-            return fast_rms_norm(hidden_states, self.weight, self.variance_epsilon)
-        except Exception:
-            return original_forward(self, hidden_states)
+        return fast_rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
     modeling_qwen2.Qwen2RMSNorm.forward = forward

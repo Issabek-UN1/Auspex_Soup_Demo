@@ -189,9 +189,6 @@ def patch_qwen2_mlp():
         if act != "silu" or not x.is_cuda:
             return original_forward(self, x)
 
-        try:
-            return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
-        except Exception:
-            return original_forward(self, x)
+        return self.down_proj(fast_swiglu(self.gate_proj(x), self.up_proj(x)))
 
     modeling_qwen2.Qwen2MLP.forward = forward

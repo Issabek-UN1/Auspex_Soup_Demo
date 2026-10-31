@@ -31,7 +31,7 @@ CONFIG = {
     "swiglu": True,
     # 5. Selective Decoder Layer Checkpointing (strictly locks peak VRAM in 2.5 - 2.7 GB)
     "decoder_checkpoint": True,
-    "num_uncheckpointed": 8,
+    "num_uncheckpointed": 4,
 }
 
 
@@ -80,7 +80,7 @@ def apply():
     # 5. Selective Decoder Layer Checkpointing (strictly locks peak VRAM in 2.5 - 2.7 GB)
     if CONFIG.get("decoder_checkpoint"):
         try:
-            k = CONFIG.get("num_uncheckpointed", 8)
+            k = CONFIG.get("num_uncheckpointed", 4)
             patch_qwen2_decoder(num_uncheckpointed=k)
         except Exception as exc:
             print(f"[SOUP-SOLUTION] Warning: failed to patch Decoder Checkpoint: {exc}", file=sys.stderr)

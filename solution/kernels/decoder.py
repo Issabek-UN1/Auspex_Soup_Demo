@@ -4,8 +4,8 @@ Calibrated to maintain peak VRAM strictly in the target 2.5 - 2.7 GB range
 while maximizing end-to-end training speed (s >= 1.77x).
 
 Architecture:
-- Layers 0 to K-1 (e.g. 0 to 7, total 8 layers): run directly with ZERO recompute overhead.
-- Layers K to 27 (e.g. 8 to 27, total 20 layers): checkpoint the entire decoder layer
+- Layers 0 to K-1 (e.g. 0 to 3, total 4 layers): run directly with ZERO recompute overhead.
+- Layers K to 27 (e.g. 4 to 27, total 24 layers): checkpoint the entire decoder layer
   via torch.utils.checkpoint.checkpoint(..., use_reentrant=False).
 - Attention uses Cutlass MemEfficient SDPA in SRAM (attention_mask=None).
 - Peak VRAM is capped strictly between 2,500 MiB and 2,680 MiB (~2.5 - 2.65 GB).
@@ -18,7 +18,7 @@ import torch
 import torch.utils.checkpoint
 
 
-def patch_qwen2_decoder(num_uncheckpointed: int = 8):
+def patch_qwen2_decoder(num_uncheckpointed: int = 4):
     """Patches Qwen2DecoderLayer.forward with selective layer checkpointing."""
     try:
         from transformers.models.qwen2 import modeling_qwen2
@@ -129,15 +129,11 @@ def patch_qwen2_decoder(num_uncheckpointed: int = 8):
         if hidden_states.is_floating_point() and not hidden_states.requires_grad:
             hidden_states = hidden_states.requires_grad_(True)
 
-        try:
-            out = torch.utils.checkpoint.checkpoint(
-                _layer_step,
-                hidden_states,
-                use_reentrant=False,
-            )
-        except Exception:
-            out = _layer_step(hidden_states)
-
+        out = torch.utils.checkpoint.checkpoint(
+            _layer_step,
+            hidden_states,
+            use_reentrant=False,
+        )
         return (out, None) if kwargs.get("output_attentions", False) else out
 
     modeling_qwen2.Qwen2DecoderLayer.forward = decoder_forward
