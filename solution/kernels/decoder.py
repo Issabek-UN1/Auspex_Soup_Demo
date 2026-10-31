@@ -125,17 +125,34 @@ def patch_qwen2_decoder(num_uncheckpointed: int = 6):
             normed = normed[0]
 
         # 2. Self Attention (attention_mask=None unlocks hardware Cutlass MemEfficient SDPA in SRAM)
-        attn_kwargs = {k: v for k, v in kwargs.items() if k != "attention_mask"}
-        attn_res = self.self_attn(
-            hidden_states=normed,
-            attention_mask=None,
-            position_ids=position_ids,
-            past_key_values=None,
-            use_cache=False,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **attn_kwargs,
-        )
+        attn_kwargs = {
+            "hidden_states": normed,
+            "attention_mask": None,
+            "position_ids": position_ids,
+            "past_key_value": None,
+            "use_cache": False,
+        }
+        if cache_position is not None:
+            attn_kwargs["cache_position"] = cache_position
+        if position_embeddings is not None:
+            attn_kwargs["position_embeddings"] = position_embeddings
+        for k, v in kwargs.items():
+            if k not in attn_kwargs and k != "attention_mask":
+                attn_kwargs[k] = v
+
+        try:
+            attn_res = self.self_attn(**attn_kwargs)
+        except TypeError:
+            # Fallback: inspect signature to only pass accepted parameters
+            import inspect
+            sig = inspect.signature(self.self_attn.forward)
+            has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not has_var_kwargs:
+                valid_kwargs = {k: v for k, v in attn_kwargs.items() if k in sig.parameters}
+            else:
+                valid_kwargs = attn_kwargs
+            attn_res = self.self_attn(**valid_kwargs)
+
         attn_out = attn_res[0] if isinstance(attn_res, tuple) else attn_res
         if isinstance(attn_out, tuple):
             attn_out = attn_out[0]
