@@ -432,8 +432,12 @@ def patch_qwen2_rope():
             cos = cos.unsqueeze(1)
             sin = sin.unsqueeze(1)
 
-        q_rot = apply_fast_rope(q, cos, sin)
-        k_rot = apply_fast_rope(k, cos, sin)
+        try:
+            q_rot, k_rot = apply_fast_rope_qk(q, k, cos, sin)
+        except Exception:
+            q_rot = apply_fast_rope(q, cos, sin)
+            k_rot = apply_fast_rope(k, cos, sin)
+
         if isinstance(q_rot, tuple):
             q_rot = q_rot[0]
         if isinstance(k_rot, tuple):
