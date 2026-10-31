@@ -118,8 +118,6 @@ def patch_qwen2_decoder(num_uncheckpointed: int = 6):
         normed = self.input_layernorm(hidden_states)
 
         # 2. Self Attention (attention_mask=None unlocks hardware Cutlass MemEfficient SDPA in SRAM)
-        # Note: Attention activations are kept in HBM (~14.7 MB/layer, 411 MB total)
-        # to completely eliminate 96 redundant forward GEMMs during backward!
         attn_kwargs = {k: v for k, v in kwargs.items() if k != "attention_mask"}
         attn_res = self.self_attn(
             hidden_states=normed,
@@ -154,6 +152,13 @@ def patch_qwen2_decoder(num_uncheckpointed: int = 6):
             )
 
         hidden_states = residual + mlp_out
-        return (hidden_states, None) if kwargs.get("output_attentions", False) else hidden_states
+
+        # Return a tuple matching HuggingFace Qwen2DecoderLayer contract: (hidden_states,)
+        outputs = (hidden_states,)
+        if kwargs.get("output_attentions", False):
+            outputs += (None,)
+        if use_cache:
+            outputs += (past_key_values,)
+        return outputs
 
     modeling_qwen2.Qwen2DecoderLayer.forward = decoder_forward

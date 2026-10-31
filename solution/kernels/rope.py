@@ -112,7 +112,6 @@ def _fused_rope_qk_bwd_kernel(
         offset2 = offset1 + HALF_DIM
         g1 = tl.load(grad_q_ptr + offset1).to(tl.float32)
         g2 = tl.load(grad_q_ptr + offset2).to(tl.float32)
-        # Inverse rotation for backward
         dx1 = g1 * c + g2 * s_val
         dx2 = g2 * c - g1 * s_val
         out_offset1 = b_idx * stride_dqb + q_h * stride_dqh + s_idx * stride_dqs + cols
@@ -125,7 +124,6 @@ def _fused_rope_qk_bwd_kernel(
         offset2 = offset1 + HALF_DIM
         g1 = tl.load(grad_k_ptr + offset1).to(tl.float32)
         g2 = tl.load(grad_k_ptr + offset2).to(tl.float32)
-        # Inverse rotation for backward
         dx1 = g1 * c + g2 * s_val
         dx2 = g2 * c - g1 * s_val
         out_offset1 = b_idx * stride_dkb + k_h * stride_dkh + s_idx * stride_dks + cols
@@ -146,8 +144,16 @@ class FusedRoPEQKFunction(torch.autograd.Function):
         out_q = torch.empty_like(q)
         out_k = torch.empty_like(k)
 
-        stride_cb = cos.stride(0) if (cos.ndim >= 3 and cos.shape[0] > 1) else 0
-        stride_cs = cos.stride(2) if cos.ndim == 4 else cos.stride(1)
+        # Standardize cos/sin to 4D [B, 1, S, D]
+        if cos.ndim == 2:
+            cos = cos.unsqueeze(0).unsqueeze(1)
+            sin = sin.unsqueeze(0).unsqueeze(1)
+        elif cos.ndim == 3:
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+
+        stride_cb = cos.stride(0) if cos.shape[0] > 1 else 0
+        stride_cs = cos.stride(2)
 
         total_h = H_q + H_k
         grid = (B * total_h, S)
@@ -322,8 +328,16 @@ class FastRoPEFunction(torch.autograd.Function):
 
         out = torch.empty_like(x)
 
-        stride_cb = cos.stride(0) if (cos.ndim >= 3 and cos.shape[0] > 1) else 0
-        stride_cs = cos.stride(2) if cos.ndim == 4 else cos.stride(1)
+        # Standardize cos/sin to 4D [B, 1, S, D]
+        if cos.ndim == 2:
+            cos = cos.unsqueeze(0).unsqueeze(1)
+            sin = sin.unsqueeze(0).unsqueeze(1)
+        elif cos.ndim == 3:
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+
+        stride_cb = cos.stride(0) if cos.shape[0] > 1 else 0
+        stride_cs = cos.stride(2)
 
         grid = (B * H, S)
         _fused_rope_2d_fwd_kernel[grid](
@@ -402,11 +416,15 @@ def patch_qwen2_rope():
         if not q.is_cuda or q.shape[-1] != 128:
             return original_apply_rotary(q, k, cos, sin, position_ids, unsqueeze_dim)
 
-        if cos.ndim == 3 and unsqueeze_dim == 1:
+        if cos.ndim == 2:
+            cos = cos.unsqueeze(0).unsqueeze(1)
+            sin = sin.unsqueeze(0).unsqueeze(1)
+        elif cos.ndim == 3 and unsqueeze_dim == 1:
             cos = cos.unsqueeze(1)
             sin = sin.unsqueeze(1)
 
-        # Fast combined Q+K RoPE
-        return apply_fast_rope_qk(q, k, cos, sin)
+        q_rot = apply_fast_rope(q, cos, sin)
+        k_rot = apply_fast_rope(k, cos, sin)
+        return q_rot, k_rot
 
     modeling_qwen2.apply_rotary_pos_emb = apply_rotary_pos_emb_patched
