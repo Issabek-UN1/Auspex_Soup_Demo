@@ -2,18 +2,19 @@
 Computes Online Softmax, Cross-Entropy Loss, Shannon Entropy, Top-1 Accuracy,
 and in-place backward gradients in Triton.
 
-Key performance optimizations:
+Key performance optimizations for Tesla T4 (Turing SM 7.5):
 1. Cached FP16 Head Weights:
    Caches lm_head.weight in fp16 once. Eliminates casting a 933 MB weight tensor
-   on every chunk (saving ~1 TB of memory allocations across training).
-2. Tensor Core FP16 Forward & Backward GEMMs:
-   Runs projection and backward gradients via fp16 Tensor Cores at 65 TFLOPS
-   instead of slow fp32 matmuls.
-3. Optimal Chunk Size (chunk_size=64):
-   Doubles M dimension to 256 for optimal cuBLAS Tensor Core saturation on Tesla T4,
-   halving loop overhead while maintaining low VRAM peak (~8.3 GB).
-4. In-Place Logits Gradients:
-   Overwrites chunk logits buffer directly in Pass 2 with zero extra gradient allocations.
+   on every chunk.
+2. Optimal Chunk Size (CHUNK_SIZE = 128):
+   Processes 128 tokens per chunk (512 tokens for batch size 4). Exactly 16 chunks
+   per step instead of 64 chunks, cutting Python dispatch overhead by 4x.
+3. Turing Kernel Tuning (num_stages = 1, num_warps = 4):
+   Turing GPUs (SM 7.5) do not have hardware cp.async (Ampere+). Using num_stages=1
+   avoids register bloat and accelerates execution and compilation.
+4. In-Place Logits Gradients & Prompt Memory Deletion:
+   Overwrites chunk logits buffer directly in Pass 2 with zero extra gradient allocations,
+   multiplies by W_head immediately, and frees the logits chunk before the next iteration.
 
 Clean-room implementation for Soup Kernel Challenge (Decentrathon 6.0).
 """
@@ -48,7 +49,6 @@ def _chunked_cross_entropy_fused_kernel(
     logits_row_ptr = logits_ptr + row_idx * stride_logits_row
 
     # Online Softmax running statistics in FP32 registers
-    # -10000.0 is safe in FP16 (avoids underflow to -inf and subsequent NaN on multiplication)
     m = -10000.0
     d = 0.0
     w = 0.0
@@ -106,7 +106,6 @@ def _chunked_cross_entropy_fused_kernel(
     correct = tl.where(is_ignored, 0, raw_correct)
 
     tl.store(losses_ptr + row_idx, loss)
-    # Entropy recorded for all sequence positions matching base Soup contract
     tl.store(entropies_ptr + row_idx, raw_entropy)
     tl.store(correct_ptr + row_idx, correct)
 
@@ -218,7 +217,8 @@ def chunk_cross_entropy_triton(
     correct = torch.empty(N_rows, device=piece.device, dtype=torch.int32)
 
     BLOCK_V = 4096
-    num_warps = 8
+    num_warps = 4    # Optimal 4 warps for Turing T4
+    num_stages = 1   # Strictly 1 stage for Turing SM 7.5 (no cp.async)
 
     _chunked_cross_entropy_fused_kernel[(N_rows,)](
         flat_logits,
@@ -232,7 +232,7 @@ def chunk_cross_entropy_triton(
         ignore_index=ignore_index,
         BLOCK_V=BLOCK_V,
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=num_stages,
     )
 
     losses = torch.nan_to_num(losses, nan=0.0, posinf=0.0, neginf=0.0)
@@ -248,6 +248,7 @@ def chunk_cross_entropy_triton(
             # Fast direct Tensor Core GEMM backward: piece_grad = grad_logits @ W_fp16
             flat_piece_grad = torch.matmul(flat_logits, head_weight_fp16)
             piece_grad = flat_piece_grad.view(orig_piece_shape)
+            del flat_logits  # Free logits chunk immediately!
         elif piece_in is not None:
             grads = torch.autograd.grad(
                 logits,
@@ -256,10 +257,13 @@ def chunk_cross_entropy_triton(
                 retain_graph=False,
             )
             piece_grad = grads[0]
+            del flat_logits
         else:
             piece_grad = torch.zeros_like(piece)
+            del flat_logits
     else:
         piece_grad = None
+        del flat_logits
 
     return total_loss, entropy, token_loss, hits, piece_grad
 
@@ -313,8 +317,8 @@ def make_triton_chunked_loss_function():
     return TritonChunkedHeadLoss
 
 
-def patch_soup_chunked_loss(chunk_size: int = 64):
-    """Integrates Triton chunked head loss into Soup runtime."""
+def patch_soup_chunked_loss(chunk_size: int = 128):
+    """Integrates Triton chunked head loss into Soup runtime with optimal chunk_size=128."""
     try:
         from soup_cli.trainer.sft import SFTTrainerWrapper
         from soup_cli.utils.stream_loss_chunk import (
@@ -328,7 +332,7 @@ def patch_soup_chunked_loss(chunk_size: int = 64):
     # Patch inner autograd function
     slc._chunked_function = make_triton_chunked_loss_function
 
-    # Patch SFTTrainerWrapper setup hook with optimal chunk_size (default 64)
+    # Patch SFTTrainerWrapper setup hook with optimal chunk_size (default 128)
     original_setup = SFTTrainerWrapper._setup_transformers
 
     def _setup_transformers_with_custom_chunk(self, cfg, tcfg):

@@ -2,7 +2,7 @@
 Validates numerical equivalence for forward and backward passes.
 
 Run on GPU:
-    pytest F:/Denene/SOUP_1.2/solution/test_kernels.py -v
+    pytest solution/test_kernels.py -v
 """
 
 import pytest
@@ -133,8 +133,8 @@ def test_chunked_ce_matches_pytorch(N_rows, V):
         denominator=denom.item(),
         ignore_index=-100,
         BLOCK_V=BLOCK_V,
-        num_warps=8,
-        num_stages=2,
+        num_warps=4,
+        num_stages=1,
     )
 
     tri_loss = losses.sum() / denom
@@ -183,6 +183,47 @@ def test_rope_matches_pytorch(dtype, shape):
     torch.testing.assert_close(x.grad, ref_x.grad, rtol=tol, atol=tol)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_rope_qk_matches_pytorch(dtype):
+    from solution.kernels.rope import apply_fast_rope_qk
+
+    torch.manual_seed(42)
+    B, H_q, H_k, S, D = 2, 12, 2, 64, 128
+    q = torch.randn((B, H_q, S, D), device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn((B, H_k, S, D), device="cuda", dtype=dtype, requires_grad=True)
+    grad_q = torch.randn((B, H_q, S, D), device="cuda", dtype=dtype)
+    grad_k = torch.randn((B, H_k, S, D), device="cuda", dtype=dtype)
+
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, D, 2, device="cuda").float() / D))
+    t = torch.arange(S, device="cuda").float()
+    freqs = torch.outer(t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos().to(dtype).unsqueeze(0).unsqueeze(0)
+    sin = emb.sin().to(dtype).unsqueeze(0).unsqueeze(0)
+
+    def ref_rotate_half(tensor):
+        x1 = tensor[..., : tensor.shape[-1] // 2]
+        x2 = tensor[..., tensor.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    ref_q = q.clone().detach().requires_grad_(True)
+    ref_k = k.clone().detach().requires_grad_(True)
+    ref_out_q = (ref_q * cos) + (ref_rotate_half(ref_q) * sin)
+    ref_out_k = (ref_k * cos) + (ref_rotate_half(ref_k) * sin)
+    (ref_out_q * grad_q).sum().backward()
+    (ref_out_k * grad_k).sum().backward()
+
+    tri_out_q, tri_out_k = apply_fast_rope_qk(q, k, cos, sin)
+    (tri_out_q * grad_q).sum().backward()
+    (tri_out_k * grad_k).sum().backward()
+
+    tol = TOLERANCE[dtype]
+    torch.testing.assert_close(tri_out_q, ref_out_q, rtol=tol, atol=tol)
+    torch.testing.assert_close(tri_out_k, ref_out_k, rtol=tol, atol=tol)
+    torch.testing.assert_close(q.grad, ref_q.grad, rtol=tol, atol=tol)
+    torch.testing.assert_close(k.grad, ref_k.grad, rtol=tol, atol=tol)
+
+
 # =====================================================================
 # 5. Checkpointed MLP Activation Recomputation Test
 # =====================================================================
@@ -194,7 +235,6 @@ def test_checkpointed_mlp_matches_reference():
     torch.manual_seed(42)
     B, S, H, intermediate = 2, 64, 256, 512
 
-    # Initialize with realistic standard deviation (1 / sqrt(dim)) to keep FP16 activations bounded
     scale_in = 1.0 / (H ** 0.5)
     scale_mid = 1.0 / (intermediate ** 0.5)
 

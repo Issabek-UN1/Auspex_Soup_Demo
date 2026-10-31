@@ -1,15 +1,16 @@
 """High-Performance Fused RMSNorm for Qwen2.5 on NVIDIA Tesla T4 (fp16).
 Forward and backward kernels in Triton with FP32 accumulators.
 
-Key optimizations over kernel_aus:
+Key optimizations for Tesla T4 (Turing SM 7.5):
 1. Zero Atomic Contention in Backward:
-   Eliminated `tl.atomic_add` to global weights from thousands of concurrent rows.
-   dx is computed row-by-row with pure register accumulation, and dw reduction
-   is performed via optimized contiguous reduction.
-2. Fast Vectorized Memory Access:
-   128-bit memory coalescing for fp16 hidden states (D=1536).
-3. Exact Mathematical Equivalence:
-   Matches PyTorch nn.RMSNorm within 1e-4 tolerance.
+   dx is computed row-by-row with pure register accumulation.
+2. Frozen Weights Fast Path (NEEDS_DW = False):
+   Under LoRA fine-tuning, RMSNorm weights are frozen. Skips weight gradient
+   accumulation completely, saving memory bandwidth and time.
+3. Turing Tuning (num_stages = 1, num_warps = 4):
+   Strictly 1 stage on SM 7.5 to prevent register spilling.
+4. Vectorized 128-bit Memory Access:
+   BLOCK_SIZE = 2048 covers hidden dimension D=1536 in a single contiguous block.
 
 Clean-room implementation for Soup Kernel Challenge (Decentrathon 6.0).
 """
@@ -109,8 +110,9 @@ class FastRMSNormFunction(torch.autograd.Function):
         out = torch.empty_like(x_2d)
         rstd = torch.empty(N, device=x.device, dtype=torch.float32)
 
-        BLOCK_SIZE = triton.next_power_of_2(D)
-        num_warps = 8 if BLOCK_SIZE >= 2048 else 4
+        BLOCK_SIZE = 2048
+        num_warps = 4
+        num_stages = 1
 
         _rms_norm_fwd_kernel[(N,)](
             x_2d,
@@ -123,7 +125,7 @@ class FastRMSNormFunction(torch.autograd.Function):
             eps=eps,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
-            num_stages=2,
+            num_stages=num_stages,
         )
 
         ctx.save_for_backward(x_2d, weight, rstd)
@@ -131,6 +133,7 @@ class FastRMSNormFunction(torch.autograd.Function):
         ctx.orig_shape = orig_shape
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
+        ctx.num_stages = num_stages
         return out.view(orig_shape)
 
     @staticmethod
@@ -155,12 +158,11 @@ class FastRMSNormFunction(torch.autograd.Function):
             D=D,
             BLOCK_SIZE=ctx.BLOCK_SIZE,
             num_warps=ctx.num_warps,
-            num_stages=2,
+            num_stages=ctx.num_stages,
         )
 
-        # 2. Compute weight gradients dw via vectorized reduction
+        # 2. Fast Path: Skip weight gradient if weights are frozen (LoRA SFT)
         if weight.requires_grad:
-            # dw = sum(dy * (x * rstd))
             x_norm = x_2d * rstd.unsqueeze(-1)
             grad_w = torch.sum(grad_2d * x_norm, dim=0).to(weight.dtype)
         else:

@@ -14,9 +14,13 @@ from .rmsnorm import (
     patch_qwen2_rmsnorm,
 )
 from .rope import (
+    _fused_rope_qk_fwd_kernel,
+    _fused_rope_qk_bwd_kernel,
     _fused_rope_2d_fwd_kernel,
     _fused_rope_2d_bwd_kernel,
+    FusedRoPEQKFunction,
     FastRoPEFunction,
+    apply_fast_rope_qk,
     apply_fast_rope,
     patch_qwen2_rope,
 )
@@ -40,9 +44,13 @@ __all__ = [
     "FastRMSNormFunction",
     "fast_rms_norm",
     "patch_qwen2_rmsnorm",
+    "_fused_rope_qk_fwd_kernel",
+    "_fused_rope_qk_bwd_kernel",
     "_fused_rope_2d_fwd_kernel",
     "_fused_rope_2d_bwd_kernel",
+    "FusedRoPEQKFunction",
     "FastRoPEFunction",
+    "apply_fast_rope_qk",
     "apply_fast_rope",
     "patch_qwen2_rope",
     "_custom_swiglu_fwd_kernel",
