@@ -18,6 +18,7 @@ Key performance optimizations for Tesla T4 (Turing SM 7.5):
 Clean-room author implementation for Soup Kernel Challenge (Decentrathon 6.0).
 """
 
+import sys
 from typing import Any, Optional, Tuple
 import torch
 import triton
@@ -351,8 +352,9 @@ def patch_soup_chunked_loss(chunk_size: int = 128):
         if getattr(self, "_stream_loss_chunk_hook", None) is None:
             try:
                 self._stream_loss_chunk_hook = ChunkedHeadLoss(causal_lm_of(model), chunk_size)
-            except Exception:
-                pass
+                print(f"[SOUP-SOLUTION] Chunked head loss hook installed (chunk={chunk_size})", file=sys.stderr)
+            except Exception as exc:
+                print(f"[SOUP-SOLUTION] Warning: chunked head loss hook NOT installed: {exc!r}", file=sys.stderr)
         return result
 
     SFTTrainerWrapper._setup_transformers = _setup_transformers_with_custom_chunk

@@ -9,7 +9,8 @@ Key features:
    Forward and backward passes write directly to output buffers without intermediate
    concatenations or copies.
 3. Turing Architecture Tuning:
-   num_stages=2 and num_warps=4 for peak register residency on SM 7.5.
+   num_stages=2 and num_warps=2 (64 threads for 64 half-dims) for peak register
+   residency and 100% warp utilization on SM 7.5.
 
 Clean-room author implementation for Soup Kernel Challenge (Decentrathon 6.0).
 """

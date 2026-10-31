@@ -28,6 +28,7 @@ from .kernels.rmsnorm import fast_rms_norm, patch_qwen2_rmsnorm
 from .kernels.swiglu import fast_swiglu, patch_qwen2_mlp
 from .kernels.rope import apply_fast_rope, patch_qwen2_rope
 from .kernels.chunked_ce import chunk_cross_entropy_triton, patch_soup_chunked_loss
+from .checkpointing import patch_layer_checkpointing
 
 
 def _configure_t4_runtime():
@@ -56,6 +57,12 @@ def apply(model=None, trainer=None, *args, **kwargs):
         patch_soup_chunked_loss(chunk_size=128)
     except Exception as exc:
         print(f"[SOUP-SOLUTION] Warning: failed to patch Chunked Loss: {exc}", file=sys.stderr)
+
+    # 1b. Activation checkpointing of decoder layers (memory; TrainingArguments untouched)
+    try:
+        patch_layer_checkpointing()
+    except Exception as exc:
+        print(f"[SOUP-SOLUTION] Warning: failed to patch layer checkpointing: {exc}", file=sys.stderr)
 
     # 2. Fused RMSNorm fwd/bwd
     try:
