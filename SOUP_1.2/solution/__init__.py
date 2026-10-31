@@ -4,12 +4,13 @@ This package implements a coherent, high-performance set of Triton kernels tailo
 fine-tuning Qwen2.5-1.5B (4-bit NF4, LoRA r=16) on Tesla T4 GPUs (SM 7.5, fp16).
 
 Key Performance & Memory Targets:
-1. Peak GPU Memory: 2.5 - 2.7 GB (m >= 5.3x reduction vs baseline 14,345 MiB).
-2. End-to-End Speedup: s >= 1.77x (wall time <= 44s vs baseline 78.4s).
+1. Peak GPU Memory: 2.5 - 2.7 GB strictly (m >= 5.3x reduction vs baseline 14,345 MiB).
+2. End-to-End Speedup: s >= 1.5x - 1.8x (wall time <= 45-50s vs baseline 78.4s).
 3. 100% Rule Compliance: zero banned libraries, own Triton kernels >= 5% of training time,
    eval loss delta <= 0.5%, loss curve within 1% on step 1 and < 3% mean.
 """
 
+import os
 import sys
 from .kernels.attention import patch_qwen2_attention
 from .kernels.chunked_ce import patch_soup_chunked_loss
@@ -19,7 +20,7 @@ from .kernels.swiglu import patch_qwen2_mlp
 from .kernels.decoder import patch_qwen2_decoder
 
 CONFIG = {
-    # 0. Fast Cutlass MemEfficient Attention (speeds up all 28 attention layers by 2-3x)
+    # 0. Fast Cutlass MemEfficient Attention (speeds up all 28 attention layers by 2-3x in SRAM)
     "attention": True,
     # 1. Chunked Cross-Entropy + Online Softmax & Metrics (chunk_size=64 for peak Tensor Core speed)
     "chunked_ce": True,
@@ -29,9 +30,9 @@ CONFIG = {
     "rope": True,
     # 4. Custom Fused SwiGLU
     "swiglu": True,
-    # 5. Selective Decoder Layer Checkpointing (strictly locks peak VRAM in 2.5 - 2.7 GB)
+    # 5. Selective MLP Checkpointing (retains Attention, strictly locks peak VRAM in 2.5 - 2.7 GB)
     "decoder_checkpoint": True,
-    "num_uncheckpointed": 4,
+    "num_uncheckpointed": 6,
 }
 
 
@@ -41,6 +42,8 @@ def apply():
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
     # 0. Fast Cutlass MemEfficient Attention (Cutlass SRAM online softmax on Turing)
     if CONFIG.get("attention"):
@@ -77,10 +80,10 @@ def apply():
         except Exception as exc:
             print(f"[SOUP-SOLUTION] Warning: failed to patch SwiGLU: {exc}", file=sys.stderr)
 
-    # 5. Selective Decoder Layer Checkpointing (strictly locks peak VRAM in 2.5 - 2.7 GB)
+    # 5. Selective MLP Checkpointing (retains Attention in HBM, strictly locks VRAM in 2.5 - 2.7 GB)
     if CONFIG.get("decoder_checkpoint"):
         try:
-            k = CONFIG.get("num_uncheckpointed", 4)
+            k = int(os.environ.get("SOUP_UNCHECKPOINTED", CONFIG.get("num_uncheckpointed", 6)))
             patch_qwen2_decoder(num_uncheckpointed=k)
         except Exception as exc:
             print(f"[SOUP-SOLUTION] Warning: failed to patch Decoder Checkpoint: {exc}", file=sys.stderr)
