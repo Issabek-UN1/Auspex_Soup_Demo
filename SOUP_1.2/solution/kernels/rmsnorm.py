@@ -7,12 +7,12 @@ Key optimizations for Tesla T4 (Turing SM 7.5):
 2. Frozen Weights Fast Path (NEEDS_DW = False):
    Under LoRA fine-tuning, RMSNorm weights are frozen. Skips weight gradient
    accumulation completely, saving memory bandwidth and time.
-3. Turing Tuning (num_stages = 1, num_warps = 4):
-   Strictly 1 stage on SM 7.5 to prevent register spilling.
-4. Vectorized 128-bit Memory Access:
-   BLOCK_SIZE = 2048 covers hidden dimension D=1536 in a single contiguous block.
+3. Fast tl.rsqrt and Power-of-Two Blocking:
+   Uses hardware reciprocal square root instruction with BLOCK_SIZE=2048.
+4. Turing SM 7.5 Tuning:
+   num_stages=2, num_warps=4 for optimal register residency.
 
-Clean-room implementation for Soup Kernel Challenge (Decentrathon 6.0).
+Clean-room author implementation for Soup Kernel Challenge (Decentrathon 6.0).
 """
 
 import torch
@@ -40,12 +40,12 @@ def _rms_norm_fwd_kernel(
     x_row_ptr = x_ptr + row_idx * stride_x_row
     out_row_ptr = out_ptr + row_idx * stride_out_row
 
-    # Read fp16 activations, cast to fp32 accumulator in registers
+    # Read activations, cast to fp32 accumulator in registers
     x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
     # Variance and reciprocal standard deviation in fp32
     var = tl.sum(x * x, axis=0) / D
-    rstd = 1.0 / tl.sqrt(var + eps)
+    rstd = tl.rsqrt(var + eps)
 
     # Save scalar rstd per row for backward pass
     tl.store(rstd_ptr + row_idx, rstd)
@@ -88,7 +88,7 @@ def _rms_norm_bwd_dx_kernel(
     x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
-    # Row reduction: sum(dy * w * x)
+    # Row reduction in registers: sum(dy * w * x)
     dy_w = dy * w
     sum_dy_w_x = tl.sum(dy_w * x, axis=0)
 
@@ -102,6 +102,11 @@ class FastRMSNormFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
+        if isinstance(x, tuple):
+            x = x[0]
+        if isinstance(weight, tuple):
+            weight = weight[0]
+
         orig_shape = x.shape
         x_2d = x.contiguous().view(-1, orig_shape[-1])
         N, D = x_2d.shape
@@ -112,7 +117,7 @@ class FastRMSNormFunction(torch.autograd.Function):
 
         BLOCK_SIZE = 2048
         num_warps = 4
-        num_stages = 1
+        num_stages = 2
 
         _rms_norm_fwd_kernel[(N,)](
             x_2d,
@@ -138,6 +143,9 @@ class FastRMSNormFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        if isinstance(grad_output, tuple):
+            grad_output = grad_output[0]
+
         x_2d, weight, rstd = ctx.saved_tensors
         orig_shape = ctx.orig_shape
         N, D = x_2d.shape

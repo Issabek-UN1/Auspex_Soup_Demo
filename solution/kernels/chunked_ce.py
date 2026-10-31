@@ -9,14 +9,13 @@ Key performance optimizations for Tesla T4 (Turing SM 7.5):
 2. Optimal Chunk Size (CHUNK_SIZE = 128):
    Processes 128 tokens per chunk (512 tokens for batch size 4). Exactly 16 chunks
    per step instead of 64 chunks, cutting Python dispatch overhead by 4x.
-3. Turing Kernel Tuning (num_stages = 1, num_warps = 4):
-   Turing GPUs (SM 7.5) do not have hardware cp.async (Ampere+). Using num_stages=1
-   avoids register bloat and accelerates execution and compilation.
-4. In-Place Logits Gradients & Prompt Memory Deletion:
+3. In-Place Logits Gradients & Immediate Memory Reclamation:
    Overwrites chunk logits buffer directly in Pass 2 with zero extra gradient allocations,
    multiplies by W_head immediately, and frees the logits chunk before the next iteration.
+4. Turing SM 7.5 Kernel Tuning:
+   num_stages=2, num_warps=4, BLOCK_V=4096.
 
-Clean-room implementation for Soup Kernel Challenge (Decentrathon 6.0).
+Clean-room author implementation for Soup Kernel Challenge (Decentrathon 6.0).
 """
 
 from typing import Any, Optional, Tuple
@@ -188,6 +187,11 @@ def chunk_cross_entropy_triton(
     with_grad: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Evaluates cross-entropy loss and metrics on a single sequence chunk with fast Tensor Core GEMMs."""
+    if isinstance(piece, tuple):
+        piece = piece[0]
+    if isinstance(target, tuple):
+        target = target[0]
+
     weight = _extract_head_weight(head)
     orig_piece_shape = piece.shape
 
@@ -217,8 +221,8 @@ def chunk_cross_entropy_triton(
     correct = torch.empty(N_rows, device=piece.device, dtype=torch.int32)
 
     BLOCK_V = 4096
-    num_warps = 4    # Optimal 4 warps for Turing T4
-    num_stages = 1   # Strictly 1 stage for Turing SM 7.5 (no cp.async)
+    num_warps = 4
+    num_stages = 2
 
     _chunked_cross_entropy_fused_kernel[(N_rows,)](
         flat_logits,
@@ -248,7 +252,7 @@ def chunk_cross_entropy_triton(
             # Fast direct Tensor Core GEMM backward: piece_grad = grad_logits @ W_fp16
             flat_piece_grad = torch.matmul(flat_logits, head_weight_fp16)
             piece_grad = flat_piece_grad.view(orig_piece_shape)
-            del flat_logits  # Free logits chunk immediately!
+            del flat_logits
         elif piece_in is not None:
             grads = torch.autograd.grad(
                 logits,

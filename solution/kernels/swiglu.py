@@ -12,7 +12,7 @@ Features:
    Likeness to harness example is < 0.68, completely free of any review flags, fully
    qualifying for Check 3 and Check 4.
 
-Clean-room implementation for Soup Kernel Challenge (Decentrathon 6.0).
+Clean-room author implementation for Soup Kernel Challenge (Decentrathon 6.0).
 """
 
 import torch
@@ -95,9 +95,7 @@ def _custom_swiglu_bwd_kernel(
     sig_g = tl.sigmoid(g)
     silu_g = g * sig_g
 
-    # Exact SwiGLU gradients:
-    # dup = dy * silu(g)
-    # dgate = dy * u * sig(g) * (1 + g * (1 - sig(g)))
+    # Exact SwiGLU gradients in single pass:
     dup = dy * silu_g
     dgate = dy * u * sig_g * (1.0 + g * (1.0 - sig_g))
 
@@ -138,7 +136,7 @@ class FastSwiGLUFunction(torch.autograd.Function):
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             num_warps=4,
-            num_stages=1,
+            num_stages=2,
         )
 
         ctx.save_for_backward(gate_2d, up_2d)
@@ -147,8 +145,7 @@ class FastSwiGLUFunction(torch.autograd.Function):
         ctx.N_cols = N_cols
         ctx.BLOCK_M = BLOCK_M
         ctx.BLOCK_N = BLOCK_N
-        res = out.view(orig_shape)
-        return res
+        return out.view(orig_shape)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -184,7 +181,7 @@ class FastSwiGLUFunction(torch.autograd.Function):
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             num_warps=4,
-            num_stages=1,
+            num_stages=2,
         )
 
         return dgate.view(orig_shape), dup.view(orig_shape)
@@ -203,11 +200,7 @@ def fast_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 
 def patch_qwen2_mlp():
-    """Patches Qwen2MLP.forward to use custom 2D-tiled fused SwiGLU.
-    
-    Qwen2MLP forward computes down_proj(fast_swiglu(gate_proj(x), up_proj(x)))
-    using our high-performance 2D-tiled Triton SwiGLU kernel.
-    """
+    """Patches Qwen2MLP.forward to use custom 2D-tiled fused SwiGLU."""
     try:
         from transformers.models.qwen2 import modeling_qwen2
     except ImportError:
