@@ -40,7 +40,7 @@ def _configure_t4_runtime():
         torch.cuda.empty_cache()
 
 
-def apply(model=None, *args, **kwargs):
+def apply(model=None, trainer=None, *args, **kwargs):
     """Master entry point called by training harness before training.
 
     Safely applies the 4 core Triton kernel patches:
@@ -74,6 +74,36 @@ def apply(model=None, *args, **kwargs):
         patch_qwen2_rope()
     except Exception as exc:
         print(f"[SOUP-SOLUTION] Warning: failed to patch RoPE: {exc}", file=sys.stderr)
+
+    # If model is passed directly, also patch instance methods
+    if model is not None:
+        try:
+            from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
+            for m in model.modules():
+                if isinstance(m, Qwen2RMSNorm):
+                    orig_rms = m.forward
+                    def make_rms_fwd(orig_fn, mod):
+                        def rms_fwd(h):
+                            if getattr(h, "is_cuda", False) and mod.weight is not None and getattr(mod.weight, "is_cuda", False):
+                                return fast_rms_norm(h, mod.weight, mod.variance_epsilon)
+                            return orig_fn(h)
+                        return rms_fwd
+                    m.forward = make_rms_fwd(orig_rms, m)
+                elif isinstance(m, Qwen2MLP):
+                    def make_mlp_fwd(mod):
+                        def mlp_fwd(x):
+                            if isinstance(x, tuple):
+                                x = x[0]
+                            g = mod.gate_proj(x)
+                            u = mod.up_proj(x)
+                            h = fast_swiglu(g, u)
+                            return mod.down_proj(h)
+                        return mlp_fwd
+                    m.forward = make_mlp_fwd(m)
+        except Exception:
+            pass
+
+    return model
 
 
 __all__ = [

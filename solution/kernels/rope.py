@@ -149,7 +149,7 @@ class FastRoPEFunction(torch.autograd.Function):
             H=H,
             S=S,
             HALF_DIM=HALF_DIM,
-            num_warps=4,
+            num_warps=2,
             num_stages=2,
         )
 
@@ -188,7 +188,7 @@ class FastRoPEFunction(torch.autograd.Function):
             H=H,
             S=S,
             HALF_DIM=HALF_DIM,
-            num_warps=4,
+            num_warps=2,
             num_stages=2,
         )
         return dx, None, None
